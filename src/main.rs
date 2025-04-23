@@ -23,9 +23,11 @@ enum Commands {
 // Token types for the lexer
 #[derive(Debug, PartialEq, Clone)]
 enum Token {
-    Fun, Pro, Let, Ident(String), Number(f64), Global,
+    Fun, Pro, Let, If, Else, While,
+    Ident(String), Number(f64), Global,
     LParen, RParen, LBrace, RBrace, Comma, Semicolon, Dot,
     Plus, Minus, Star, Slash, Equals,
+    Less, Greater, LessEqual, GreaterEqual, EqualEqual, NotEqual,
     EOF,
 }
 
@@ -62,7 +64,38 @@ impl Lexer {
             '-' => Token::Minus,
             '*' => Token::Star,
             '/' => Token::Slash,
-            '=' => Token::Equals,
+            '=' => {
+                if self.position < self.input.len() && self.input[self.position] == '=' {
+                    self.position += 1;
+                    Token::EqualEqual
+                } else {
+                    Token::Equals
+                }
+            }
+            '<' => {
+                if self.position < self.input.len() && self.input[self.position] == '=' {
+                    self.position += 1;
+                    Token::LessEqual
+                } else {
+                    Token::Less
+                }
+            }
+            '>' => {
+                if self.position < self.input.len() && self.input[self.position] == '=' {
+                    self.position += 1;
+                    Token::GreaterEqual
+                } else {
+                    Token::Greater
+                }
+            }
+            '!' => {
+                if self.position < self.input.len() && self.input[self.position] == '=' {
+                    self.position += 1;
+                    Token::NotEqual
+                } else {
+                    Token::EOF // Could add ! for logical NOT later
+                }
+            }
             _ if ch.is_alphabetic() => {
                 let mut ident = ch.to_string();
                 while self.position < self.input.len() && (self.input[self.position].is_alphanumeric() || self.input[self.position] == '_') {
@@ -73,6 +106,9 @@ impl Lexer {
                     "fun" => Token::Fun,
                     "pro" => Token::Pro,
                     "let" => Token::Let,
+                    "if" => Token::If,
+                    "else" => Token::Else,
+                    "while" => Token::While,
                     "global" => Token::Global,
                     _ => Token::Ident(ident),
                 }
@@ -109,9 +145,11 @@ enum Expr {
 #[derive(Debug, Clone)]
 enum Stmt {
     Let(String, Expr),
-    Fun(String, Vec<String>, Expr), // name, params, body, return expr
-    Pro(String, Vec<String>, Vec<Stmt>),      // name, params, body
+    Fun(String, Vec<String>, Expr),
+    Pro(String, Vec<String>, Vec<Stmt>),
     Expr(Expr),
+    If(Expr, Vec<Stmt>, Option<Vec<Stmt>>), // condition, then branch, optional else branch
+    While(Expr, Vec<Stmt>), // condition, body
 }
 
 // Parser to build AST
@@ -136,7 +174,6 @@ impl PelgaianParser {
     fn parse(&mut self) -> Vec<Stmt> {
         let mut stmts = Vec::new();
         while self.current() != &Token::EOF {
-            println!("Parsing statement at position {}: {:?}", self.position, self.current());
             stmts.push(self.parse_stmt());
         }
         stmts
@@ -215,6 +252,50 @@ impl PelgaianParser {
                 }
                 Stmt::Pro(name, params, body)
             }
+            Token::If => {
+                self.advance();
+                if self.current() != &Token::LParen {
+                    panic!("Expected ( after if at position {}", self.position);
+                }
+                self.advance();
+                let condition = self.parse_expr();
+                if self.current() != &Token::RParen {
+                    panic!("Expected ) after if condition at position {}", self.position);
+                }
+                self.advance();
+                let then_branch = self.parse_body();
+                let else_branch = if self.current() == &Token::Else {
+                    self.advance();
+                    Some(self.parse_body())
+                } else {
+                    None
+                };
+                if self.current() == &Token::Semicolon {
+                    self.advance();
+                } else {
+                    panic!("Expected ; after if statement at position {}", self.position);
+                }
+                Stmt::If(condition, then_branch, else_branch)
+            }
+            Token::While => {
+                self.advance();
+                if self.current() != &Token::LParen {
+                    panic!("Expected ( after while at position {}", self.position);
+                }
+                self.advance();
+                let condition = self.parse_expr();
+                if self.current() != &Token::RParen {
+                    panic!("Expected ) after while condition at position {}", self.position);
+                }
+                self.advance();
+                let body = self.parse_body();
+                if self.current() == &Token::Semicolon {
+                    self.advance();
+                } else {
+                    panic!("Expected ; after while statement at position {}", self.position);
+                }
+                Stmt::While(condition, body)
+            }
             _ => {
                 let expr = self.parse_expr();
                 if self.current() == &Token::Semicolon {
@@ -262,9 +343,8 @@ impl PelgaianParser {
     }
 
     fn parse_expr(&mut self) -> Expr {
-        println!("Parsing expr at position {}: {:?}", self.position, self.current());
         let mut expr = self.parse_term();
-        while matches!(self.current(), Token::Plus | Token::Minus) {
+        while matches!(self.current(), Token::Plus | Token::Minus | Token::Less | Token::Greater | Token::LessEqual | Token::GreaterEqual | Token::EqualEqual | Token::NotEqual) {
             let op = self.current().clone();
             self.advance();
             let right = self.parse_term();
@@ -285,7 +365,6 @@ impl PelgaianParser {
     }
 
     fn parse_factor(&mut self) -> Expr {
-        println!("Parsing factor at position {}: {:?}", self.position, self.current());
         match self.current() {
             Token::Number(n) => {
                 let expr = Expr::Number(*n);
@@ -419,6 +498,33 @@ impl Interpreter {
                 Ok(0.0)
             }
             Stmt::Expr(expr) => self.eval_expr(expr, env),
+            Stmt::If(condition, then_branch, else_branch) => {
+                let cond_value = self.eval_expr(condition, env)?;
+                if cond_value != 0.0 {
+                    let mut last = 0.0;
+                    for stmt in then_branch {
+                        last = self.eval_stmt(stmt, env)?;
+                    }
+                    Ok(last)
+                } else if let Some(else_stmts) = else_branch {
+                    let mut last = 0.0;
+                    for stmt in else_stmts {
+                        last = self.eval_stmt(stmt, env)?;
+                    }
+                    Ok(last)
+                } else {
+                    Ok(0.0)
+                }
+            }
+            Stmt::While(condition, body) => {
+                let mut last = 0.0;
+                while self.eval_expr(condition, env)? != 0.0 {
+                    for stmt in body {
+                        last = self.eval_stmt(stmt, env)?;
+                    }
+                }
+                Ok(last)
+            }
         }
     }
 
@@ -434,6 +540,12 @@ impl Interpreter {
                     Token::Minus => Ok(l - r),
                     Token::Star => Ok(l * r),
                     Token::Slash => Ok(l / r),
+                    Token::Less => Ok(if l < r { 1.0 } else { 0.0 }),
+                    Token::Greater => Ok(if l > r { 1.0 } else { 0.0 }),
+                    Token::LessEqual => Ok(if l <= r { 1.0 } else { 0.0 }),
+                    Token::GreaterEqual => Ok(if l >= r { 1.0 } else { 0.0 }),
+                    Token::EqualEqual => Ok(if l == r { 1.0 } else { 0.0 }),
+                    Token::NotEqual => Ok(if l != r { 1.0 } else { 0.0 }),
                     _ => Err("Invalid operator".to_string()),
                 }
             }
